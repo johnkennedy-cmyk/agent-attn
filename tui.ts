@@ -75,7 +75,7 @@ function circleArt(diam: number, color: string, cols: number): string[] {
   return lines;
 }
 
-function buildFrame(rows: Row[], cols: number, rowsAvail: number): string {
+function buildFrame(rows: Row[], cols: number, rowsAvail: number, phase = 0): string {
   const waiting = rows.filter((r) => r.state === "waiting");
   const working = rows.filter((r) => r.state === "working");
   const color = waiting.length ? C.red : working.length ? C.orange : C.green;
@@ -91,10 +91,17 @@ function buildFrame(rows: Row[], cols: number, rowsAvail: number): string {
   }
   // The big light: fill whatever is left, capped by the width it needs (2:1).
   const spare = rowsAvail - lines.length - 1;
-  const diam = Math.min(spare, Math.floor(cols / 2));
-  if (diam >= 3) {
+  const full = Math.min(spare, Math.floor(cols / 2));
+  if (full >= 3) {
+    // Red state pulses: alternate 100% / 90% diameter, padded so the light
+    // throbs in place instead of shifting the layout.
+    const shrink = waiting.length > 0 && phase % 2 === 1;
+    const diam = shrink ? Math.max(3, Math.round(full * 0.9)) : full;
+    const padTop = Math.floor((full - diam) / 2);
     lines.push("");
+    for (let i = 0; i < padTop; i++) lines.push("");
     lines.push(...circleArt(diam, color, cols));
+    for (let i = 0; i < full - diam - padTop; i++) lines.push("");
   }
   return lines.join("\r\n");
 }
@@ -125,10 +132,17 @@ if (once) {
   process.exit(0);
 }
 
-async function render() {
-  const rows = await collect();
+let rows: Row[] = [];
+let phase = 0;
+
+async function refresh() {
+  rows = await collect();
   notifyNewWaiting(rows);
-  out(`${E}H${E}2J` + buildFrame(rows, process.stdout.columns ?? 80, process.stdout.rows ?? 24));
+}
+
+function render() {
+  phase++;
+  out(`${E}H${E}2J` + buildFrame(rows, process.stdout.columns ?? 80, process.stdout.rows ?? 24, phase));
 }
 
 function cleanup() {
@@ -147,5 +161,7 @@ if (process.stdin.isTTY) {
     if (ch === "q" || ch === "\x03") cleanup();
   });
 }
-await render();
-setInterval(render, POLL_MS);
+await refresh();
+render();
+setInterval(refresh, POLL_MS);
+setInterval(render, 500); // animation tick — pulses the light when red
