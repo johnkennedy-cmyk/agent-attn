@@ -4,7 +4,7 @@ One circle that answers "is any agent waiting on me?"
 
 ```
 ●  WAITING (1)
-● claude-code cloudv2 — waiting 4m
+● claude-code my-project — waiting 4m
 ● claude-desktop cowork — working
 ```
 
