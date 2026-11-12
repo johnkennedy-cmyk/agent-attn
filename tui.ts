@@ -60,16 +60,41 @@ const ago = (ts: number) => {
 
 let notified = new Set<string>();
 
+// A filled circle drawn in block cells, diameter `diam` rows, centered in
+// `cols` columns (terminal cells are ~2:1 tall, so width = 2× the row span).
+function circleArt(diam: number, color: string, cols: number): string[] {
+  const lines: string[] = [];
+  const r = diam / 2;
+  for (let y = 0; y < diam; y++) {
+    const dy = (y + 0.5 - r) / r;
+    const w = Math.round(Math.sqrt(Math.max(0, 1 - dy * dy)) * diam * 2);
+    if (w === 0) { lines.push(""); continue; }
+    const pad = Math.max(0, Math.floor((cols - w) / 2));
+    lines.push(" ".repeat(pad) + color + "█".repeat(Math.min(w, cols)) + C.reset);
+  }
+  return lines;
+}
+
 function buildFrame(rows: Row[], cols: number, rowsAvail: number): string {
   const waiting = rows.filter((r) => r.state === "waiting");
   const working = rows.filter((r) => r.state === "working");
   const color = waiting.length ? C.red : working.length ? C.orange : C.green;
   const word = waiting.length ? `WAITING (${waiting.length})` : working.length ? `working (${working.length})` : "idle";
   const lines = [`${color}${C.bold}●  ${word}${C.reset}`];
-  for (const r of [...waiting, ...working].slice(0, rowsAvail - 1)) {
+  // The list keeps at most half the window so the light below stays large;
+  // a non-interactive snapshot (--once without a TTY) never drops rows.
+  const listMax = process.stdout.isTTY ? Math.max(1, Math.floor(rowsAvail / 2) - 1) : rows.length;
+  for (const r of [...waiting, ...working].slice(0, listMax)) {
     const mark = r.state === "waiting" ? `${C.red}●${C.reset}` : `${C.orange}●${C.reset}`;
     const tail = r.state === "waiting" ? `${C.red}waiting ${ago(r.ts)}${C.reset}` : `${C.grey}working${C.reset}`;
     lines.push(`${mark} ${r.source} ${C.bold}${r.label}${C.reset} — ${tail}`.slice(0, cols + 40));
+  }
+  // The big light: fill whatever is left, capped by the width it needs (2:1).
+  const spare = rowsAvail - lines.length - 1;
+  const diam = Math.min(spare, Math.floor(cols / 2));
+  if (diam >= 3) {
+    lines.push("");
+    lines.push(...circleArt(diam, color, cols));
   }
   return lines.join("\r\n");
 }
@@ -96,7 +121,7 @@ const once = process.argv.includes("--once");
 const out = (s: string) => process.stdout.write(s);
 
 if (once) {
-  out(buildFrame(await collect(), process.stdout.columns ?? 80, 9999) + "\n");
+  out(buildFrame(await collect(), process.stdout.columns ?? 52, process.stdout.rows ?? 16) + "\n");
   process.exit(0);
 }
 
