@@ -19,6 +19,7 @@ One circle that answers "is any agent waiting on me?"
 | --- | --- | --- |
 | Claude Code | `hook.mjs` on UserPromptSubmit / Stop / Notification / SessionEnd, writing `~/.agent-attn/state/` | precise |
 | Claude Desktop (Cowork) | `coworkd.log` freshness | working-only — no reliable "waiting" signal exists |
+| Cursor | `hook.mjs cursor` on beforeSubmitPrompt / stop / sessionEnd via `~/.cursor/hooks.json` | precise — **untested** (Cursor not installed on the authoring machine); rows dropped when Cursor isn't running |
 | gemini-cli | stub (not installed here) | — |
 | Antigravity | stub (not installed here) | — |
 
@@ -32,7 +33,18 @@ run a command on turn boundaries can join by writing one.
    ```json
    {"hooks": [{"type": "command", "command": "\"/usr/local/bin/node\" \"<repo>/hook.mjs\"", "timeout": 5}]}
    ```
-2. `./run.sh` in a small terminal window (6×52 is plenty), or add
+2. For Cursor, create `~/.cursor/hooks.json` (Cursor reloads it automatically):
+   ```json
+   {
+     "version": 1,
+     "hooks": {
+       "beforeSubmitPrompt": [{ "command": "/usr/local/bin/node \"<repo>/hook.mjs\" cursor" }],
+       "stop": [{ "command": "/usr/local/bin/node \"<repo>/hook.mjs\" cursor" }],
+       "sessionEnd": [{ "command": "/usr/local/bin/node \"<repo>/hook.mjs\" cursor" }]
+     }
+   }
+   ```
+3. `./run.sh` in a small terminal window (16×52 is plenty), or add
    `agent-attn.command` to Login Items for a window at every login.
 
 Keys: `q` quit. `./run.sh --once` prints one frame. Requires bun + node.

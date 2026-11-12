@@ -119,9 +119,20 @@ function notifyNewWaiting(rows: Row[]) {
   notified = current;
 }
 
+async function processAlive(pattern: string): Promise<boolean> {
+  const p = Bun.spawn(["pgrep", "-f", pattern], { stdout: "ignore", stderr: "ignore" });
+  return (await p.exited) === 0;
+}
+
 async function collect(): Promise<Row[]> {
-  const [cc, cw, gm, ag] = await Promise.all([claudeCodeRows(), coworkRow(), geminiRows(), antigravityRows()]);
-  return [...cc, ...(cw ? [cw] : []), ...gm, ...ag];
+  const [state, cw, gm, ag] = await Promise.all([claudeCodeRows(), coworkRow(), geminiRows(), antigravityRows()]);
+  let rows = [...state, ...(cw ? [cw] : []), ...gm, ...ag];
+  // A quit app can't send its "session end" hook — drop its leftover rows.
+  if (rows.some((r) => r.source === "cursor") && !(await processAlive("Cursor.app/Contents/MacOS"))) {
+    for (const r of rows.filter((r) => r.source === "cursor")) unlink(join(STATE_DIR, r.id)).catch(() => {});
+    rows = rows.filter((r) => r.source !== "cursor");
+  }
+  return rows;
 }
 
 const once = process.argv.includes("--once");
