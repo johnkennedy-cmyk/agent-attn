@@ -47,4 +47,9 @@ run a command on turn boundaries can join by writing one.
 3. `./run.sh` in a small terminal window (16×52 is plenty), or add
    `agent-attn.command` to Login Items for a window at every login.
 
-Keys: `q` quit. `./run.sh --once` prints one frame. Requires bun + node.
+Keys: `q` quit, `c` clear (acknowledge) all waiting rows. `./run.sh --once`
+prints one frame. Requires bun + node.
+
+Why `c` exists: a Claude Code session closed back to the main menu never fires
+`SessionEnd`, so its final Stop event leaves a red row until you either resume
+that session or acknowledge it.

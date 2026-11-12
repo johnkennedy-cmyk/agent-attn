@@ -80,7 +80,9 @@ function buildFrame(rows: Row[], cols: number, rowsAvail: number, phase = 0): st
   const working = rows.filter((r) => r.state === "working");
   const color = waiting.length ? C.red : working.length ? C.orange : C.green;
   const word = waiting.length ? `WAITING (${waiting.length})` : working.length ? `working (${working.length})` : "idle";
-  const lines = [`${color}${C.bold}●  ${word}${C.reset}`];
+  const hint = `${C.grey}c=clear q=quit${C.reset}`;
+  const head = `${color}${C.bold}●  ${word}${C.reset}`;
+  const lines = [head + " ".repeat(Math.max(1, cols - (word.length + 3) - 14)) + hint];
   // The list keeps at most half the window so the light below stays large;
   // a non-interactive snapshot (--once without a TTY) never drops rows.
   const listMax = process.stdout.isTTY ? Math.max(1, Math.floor(rowsAvail / 2) - 1) : rows.length;
@@ -165,11 +167,29 @@ out(`${E}?1049h${E}?25l`);
 process.on("SIGINT", cleanup);
 process.on("SIGTERM", cleanup);
 process.stdout.on("resize", render);
+// Acknowledge: a session closed back to the main menu never fires SessionEnd,
+// so its final Stop leaves a red row forever. `c` clears current waiting rows.
+async function clearWaiting() {
+  for (const r of rows.filter((r) => r.state === "waiting" && r.id.endsWith(".json"))) {
+    const path = join(STATE_DIR, r.id);
+    try {
+      // Re-read: the session may have gone back to working since the last poll.
+      const current = JSON.parse(await readFile(path, "utf8"));
+      if (current.state === "waiting") await unlink(path);
+    } catch {
+      /* already gone or mid-rewrite — leave it */
+    }
+  }
+  await refresh();
+  render();
+}
+
 if (process.stdin.isTTY) {
   process.stdin.setRawMode(true);
   process.stdin.on("data", (d: Buffer) => {
     const ch = d.toString();
     if (ch === "q" || ch === "\x03") cleanup();
+    if (ch === "c") void clearWaiting();
   });
 }
 await refresh();
