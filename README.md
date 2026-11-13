@@ -18,7 +18,7 @@ One circle that answers "is any agent waiting on me?"
 | Agent | Signal | Fidelity |
 | --- | --- | --- |
 | Claude Code | `hook.mjs` on UserPromptSubmit / Stop / Notification / SessionEnd, writing `~/.agent-attn/state/` | precise |
-| Claude Desktop (Cowork) | `coworkd.log` freshness | working-only — no reliable "waiting" signal exists |
+| Claude Desktop (Cowork) | the job's live Claude Code SDK process (`pgrep`) | working-only — no reliable "waiting" signal exists |
 | Cursor IDE | `hook.mjs cursor` on beforeSubmitPrompt / stop / sessionEnd via `~/.cursor/hooks.json` | precise — rows dropped when Cursor.app isn't running |
 | Cursor agents | self-hosted worker log, one row per open claim on a live worker | `cursor-agent <project> — working` while a shell or context line is under 2 minutes old; `waiting` after that until the claim is parked or released (dropped after a day). Heartbeat `Received frame` lines do not count |
 | Cursor cloud agents | `cloudAgentRepository.agents` in `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` | `cursor-cloud <name> — working` when last activity is under 10 minutes; `waiting` when `hasPendingInteraction` is set (dropped after a day). Private-worker sessions are left to the worker log |
@@ -53,7 +53,8 @@ run a command on turn boundaries can join by writing one.
    `agent-attn.command` to Login Items for a window at every login.
 
 Keys: `q` quit, `c` clear (acknowledge) all waiting rows. `./run.sh --once`
-prints one frame. Requires bun + node.
+prints one frame, `bun tui.ts --selftest` runs the unit checks. Requires bun +
+node.
 
 Why `c` exists: a Claude Code session closed back to the main menu never fires
 `SessionEnd`, so its final Stop event leaves a red row until you either resume

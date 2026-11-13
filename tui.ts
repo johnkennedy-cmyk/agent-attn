@@ -2,7 +2,7 @@
 // agent is waiting on you — plus one row per live agent session.
 // Run: bun tui.ts   (q quits, --once prints one frame)
 // Sources: Claude Code via hook.mjs state files (precise); Claude Desktop
-// Cowork via coworkd.log freshness (working-only — no reliable "waiting"
+// Cowork via its live SDK process (working-only — no reliable "waiting"
 // signal exists for it yet); Cursor IDE via hook.mjs state files; Cursor
 // agents via the self-hosted worker log; Cursor cloud sessions via
 // state.vscdb (usePrivateWorker false); gemini-cli / Antigravity: stubs.
@@ -15,8 +15,9 @@ const HOME = process.env.HOME ?? "";
 const STATE_DIR = join(HOME, ".agent-attn", "state");
 const POLL_MS = 2000;
 const STALE_MS = 24 * 3600_000; // drop sessions with no signal for a day
-const COWORK_LOG = join(HOME, "Library", "Logs", "Claude", "coworkd.log");
-const COWORK_FRESH_MS = 60_000;
+// Cowork runs each job as a Claude Code SDK child whose --debug-file lives
+// under this directory, and that process exits when the job ends.
+const COWORK_PATTERN = "MacOS/claude.*local-agent-mode-sessions";
 // Self-hosted `cursor-agent worker` processes. ~/.cursor/hooks.json is not
 // re-read after the worker starts, and cloud/My Machines agents do not use it
 // for the session anyway. The worker log is the local signal.
@@ -186,12 +187,39 @@ function cloudAgentRows(seenBcIds: Set<string>): Row[] {
   }
 }
 
-async function coworkRow(): Promise<Row | null> {
-  // ponytail: log freshness only — says "working", can never say "waiting";
-  // upgrade path is a real Cowork signal if one ever ships.
-  const st = await stat(COWORK_LOG).catch(() => null);
-  if (!st || Date.now() - st.mtimeMs > COWORK_FRESH_MS) return null;
-  return { id: "cowork", label: "cowork", source: "claude-desktop", state: "working", ts: st.mtimeMs };
+// `ps` elapsed time ([[dd-]hh:]mm:ss) -> seconds.
+export function etimeSeconds(s: string): number {
+  const [days, rest] = s.includes("-") ? s.split("-") : ["0", s];
+  const parts = rest.split(":").map(Number);
+  while (parts.length < 3) parts.unshift(0);
+  return Number(days) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+
+async function coworkRows(): Promise<Row[]> {
+  // ponytail: process presence only — says "working", can never say "waiting";
+  // upgrade path is the job's sdk-debug.txt, which logs a turn-complete line.
+  // NOT coworkd.log freshness: that daemon log only writes when a job SPAWNS,
+  // so any job running longer than the freshness window vanished from the list.
+  const pg = Bun.spawn(["pgrep", "-f", COWORK_PATTERN], { stdout: "pipe", stderr: "ignore" });
+  const pids = (await new Response(pg.stdout).text()).split("\n").filter(Boolean);
+  if (!pids.length) return [];
+  // pgrep also matches the Claude.app wrapper, whose argv carries the child's
+  // path; `comm` is the binary itself, so it keeps one row per actual job.
+  // (macOS `ps` truncates argv, which is why the match has to happen in pgrep.)
+  const ps = Bun.spawn(["ps", "-p", pids.join(","), "-o", "pid=,etime=,comm="], { stdout: "pipe", stderr: "ignore" });
+  const rows: Row[] = [];
+  for (const line of (await new Response(ps.stdout).text()).split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m || !m[3].endsWith("MacOS/claude")) continue;
+    rows.push({
+      id: `cowork-${m[1]}`,
+      label: "cowork",
+      source: "claude-desktop",
+      state: "working",
+      ts: Date.now() - etimeSeconds(m[2]) * 1000,
+    });
+  }
+  return rows;
 }
 
 // Probe stubs — neither tool is installed on this machine today.
@@ -275,15 +303,26 @@ async function processAlive(pattern: string): Promise<boolean> {
 }
 
 async function collect(): Promise<Row[]> {
-  const [state, cw, agents, gm, ag] = await Promise.all([claudeCodeRows(), coworkRow(), cursorAgentRows(), geminiRows(), antigravityRows()]);
+  const [state, cw, agents, gm, ag] = await Promise.all([claudeCodeRows(), coworkRows(), cursorAgentRows(), geminiRows(), antigravityRows()]);
   const seenBc = new Set(agents.map((r) => r.id.replace(/^cursor-agent-/, "")));
-  let rows = [...state, ...(cw ? [cw] : []), ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag].filter((r) => ackedWaiting.get(r.id) !== r.ts);
+  let rows = [...state, ...cw, ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag].filter((r) => ackedWaiting.get(r.id) !== r.ts);
   // A quit app can't send its "session end" hook — drop its leftover rows.
   if (rows.some((r) => r.source === "cursor") && !(await processAlive("Cursor.app/Contents/MacOS"))) {
     for (const r of rows.filter((r) => r.source === "cursor")) unlink(join(STATE_DIR, r.id)).catch(() => {});
     rows = rows.filter((r) => r.source !== "cursor");
   }
   return rows;
+}
+
+if (process.argv.includes("--selftest")) {
+  const eq = (got: number, want: number, label: string) => {
+    if (got !== want) throw new Error(`${label}: got ${got}, want ${want}`);
+  };
+  eq(etimeSeconds("09:30"), 570, "mm:ss");
+  eq(etimeSeconds("1:02:03"), 3723, "hh:mm:ss");
+  eq(etimeSeconds("2-03:04:05"), 183845, "dd-hh:mm:ss");
+  console.log("selftest ok");
+  process.exit(0);
 }
 
 const once = process.argv.includes("--once");
