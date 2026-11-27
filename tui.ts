@@ -207,7 +207,10 @@ function cloudAgentRows(seenBcIds: Set<string>): Row[] {
 const DESKTOP_RE = {
   working: /LocalAgentModeSessions\.sendMessage: sessionId=(local_[0-9a-f-]+)/,
   waiting: /\[WarmLifecycle:cowork\] Starting idle timeout for (local_[0-9a-f-]+)/,
-  gone: /\[WarmLifecycle:cowork\] Idle timeout reached, disconnecting (local_[0-9a-f-]+)/,
+  // A warm idle disconnect does NOT end the session (it still waits in the
+  // UI), so it is deliberately not an event. App quit is: the VM and every
+  // local session die with the app, invalidating all lines logged before it.
+  quit: /Running onQuitCleanup: cowork-vm-shutdown/,
   ask: /Emitted tool permission request ([0-9a-f-]+) for \S+ in session (local_[0-9a-f-]+)/,
   answer: /LocalAgentModeSessions\.respondToToolPermission: requestId=([0-9a-f-]+)/,
 };
@@ -235,7 +238,7 @@ async function desktopLabel(id: string): Promise<string> {
 async function coworkRows(): Promise<Row[]> {
   const text = await readTail(MAIN_LOG, MAIN_LOG_TAIL);
   if (!text) return [];
-  const latest = new Map<string, { state: Row["state"] | "gone"; ts: number }>();
+  const latest = new Map<string, { state: Row["state"]; ts: number }>();
   const askedBy = new Map<string, string>(); // permission requestId -> session id
   for (const line of text.split("\n")) {
     // "YYYY-MM-DD HH:MM:SS" prefix, local time; continuation lines have none.
@@ -243,9 +246,15 @@ async function coworkRows(): Promise<Row[]> {
     if (!Number.isFinite(ts)) continue;
     let m: RegExpExecArray | null;
     if ((m = DESKTOP_RE.working.exec(line))) latest.set(m[1], { state: "working", ts });
-    else if ((m = DESKTOP_RE.waiting.exec(line))) latest.set(m[1], { state: "waiting", ts });
-    else if ((m = DESKTOP_RE.gone.exec(line))) latest.set(m[1], { state: "gone", ts });
-    else if ((m = DESKTOP_RE.ask.exec(line))) {
+    else if ((m = DESKTOP_RE.waiting.exec(line))) {
+      // The idle timer re-arms repeatedly during one idle period; keep the
+      // first ts so `c` acknowledgements hold and the wait age doesn't reset.
+      const prev = latest.get(m[1]);
+      latest.set(m[1], { state: "waiting", ts: prev?.state === "waiting" ? prev.ts : ts });
+    } else if (DESKTOP_RE.quit.test(line)) {
+      latest.clear();
+      askedBy.clear();
+    } else if ((m = DESKTOP_RE.ask.exec(line))) {
       askedBy.set(m[1], m[2]);
       latest.set(m[2], { state: "waiting", ts });
     } else if ((m = DESKTOP_RE.answer.exec(line))) {
@@ -255,7 +264,7 @@ async function coworkRows(): Promise<Row[]> {
   }
   const rows: Row[] = [];
   for (const [id, { state, ts }] of latest) {
-    if (state === "gone" || Date.now() - ts > STALE_MS) continue;
+    if (Date.now() - ts > STALE_MS) continue;
     rows.push({ id: `claude-desktop-${id}`, label: await desktopLabel(id), source: "claude-desktop", state, ts });
   }
   return rows;
@@ -389,9 +398,11 @@ async function collect(): Promise<Row[]> {
     for (const r of rows.filter((r) => r.source === "cursor")) unlink(join(STATE_DIR, r.id)).catch(() => {});
     rows = rows.filter((r) => r.source !== "cursor");
   }
-  // Same for Claude Desktop: its last main.log lines outlive the app.
-  if (rows.some((r) => r.source === "claude-desktop") && !(await processAlive("Claude.app/Contents/MacOS/Claude"))) {
-    rows = rows.filter((r) => r.source !== "claude-desktop");
+  // Same for Claude Desktop LOCAL sessions: their main.log lines outlive the
+  // app. Cloud rows stay — a cloud turn keeps running with the app closed,
+  // and they self-expire after COWORK_VM_FRESH_MS anyway.
+  if (rows.some((r) => r.id.startsWith("claude-desktop-local_")) && !(await processAlive("Claude.app/Contents/MacOS/Claude"))) {
+    rows = rows.filter((r) => !r.id.startsWith("claude-desktop-local_"));
   }
   return rows;
 }

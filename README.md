@@ -18,7 +18,7 @@ One circle that answers "is any agent waiting on me?"
 | Agent | Signal | Fidelity |
 | --- | --- | --- |
 | Claude Code | `hook.mjs` on UserPromptSubmit / Stop / Notification / SessionEnd, writing `~/.agent-attn/state/` | precise |
-| Claude Desktop (Cowork, local) | session lifecycle lines in `~/Library/Logs/Claude/main.log` (`sendMessage`, `WarmLifecycle:cowork` idle timeout, tool-permission request/response) | per-session working AND waiting; row named from the session title; rows dropped when Claude.app isn't running |
+| Claude Desktop (Cowork, local) | session lifecycle lines in `~/Library/Logs/Claude/main.log` (`sendMessage`, `WarmLifecycle:cowork` idle timeout, tool-permission request/response) | per-session working AND waiting; row named from the session title; a waiting row stays until `c`, a new prompt, or app quit; rows dropped when Claude.app isn't running |
 | Claude Desktop (Cowork, cloud) | `[vmOneShot]` lines in `~/Library/Logs/Claude/cowork_vm_node.log` — a cloud session's only local footprint | working-only while a one-shot is under 10 minutes old; row named from the session's first shared folder |
 | Cursor IDE | `hook.mjs cursor` on beforeSubmitPrompt / stop / sessionEnd via `~/.cursor/hooks.json` | precise — rows dropped when Cursor.app isn't running |
 | Cursor agents | self-hosted worker log, one row per open claim on a live worker | `cursor-agent <project> — working` while a shell or context line is under 2 minutes old; `waiting` after that until the claim is parked or released (dropped after a day). Heartbeat `Received frame` lines do not count |
