@@ -215,11 +215,15 @@ const DESKTOP_RE = {
   answer: /LocalAgentModeSessions\.respondToToolPermission: requestId=([0-9a-f-]+)/,
 };
 const desktopTitles = new Map<string, string>();
-// Wait-episode starts, remembered across polls: the fold's first waiting ts
-// drifts forward as pre-episode lines roll out of the log tail, which would
-// reset the shown age and bust `c` acknowledgements. An entry is only valid
-// while no working event newer than it appears in the tail.
-const waitingSince = new Map<string, number>();
+// Persistent fold state. main.log is read incrementally from the last byte
+// offset, so every event is seen exactly once and episode identity is exact —
+// re-deriving state from a rolling tail window proved structurally leaky
+// (ages reset, acknowledgements broke) as old lines rolled out.
+const desktop = {
+  offset: -1, // -1 = not seeded yet; also reset when the log rotates under us
+  latest: new Map<string, { state: Row["state"]; ts: number }>(),
+  askedBy: new Map<string, string>(), // permission requestId -> session id
+};
 
 async function desktopLabel(id: string): Promise<string> {
   const hit = desktopTitles.get(id);
@@ -240,54 +244,69 @@ async function desktopLabel(id: string): Promise<string> {
   return id.slice("local_".length, "local_".length + 8);
 }
 
-async function coworkRows(): Promise<Row[]> {
-  const text = await readTail(MAIN_LOG, MAIN_LOG_TAIL);
-  if (!text) return [];
-  const latest = new Map<string, { state: Row["state"]; ts: number }>();
-  const lastWork = new Map<string, number>(); // last working EVENT, even if not the final state
-  const askedBy = new Map<string, string>(); // permission requestId -> session id
-  const work = (id: string, ts: number) => {
-    latest.set(id, { state: "working", ts });
-    lastWork.set(id, ts);
+function foldDesktopLine(line: string) {
+  // "YYYY-MM-DD HH:MM:SS" prefix, local time; continuation lines have none.
+  const ts = Date.parse(line.slice(0, 19).replace(" ", "T"));
+  if (!Number.isFinite(ts)) return;
+  const work = (id: string) => {
+    desktop.latest.set(id, { state: "working", ts });
+    // Real new activity (seen exactly once) retires any acknowledgement.
+    ackedWaiting.delete(`claude-desktop-${id}`);
   };
-  for (const line of text.split("\n")) {
-    // "YYYY-MM-DD HH:MM:SS" prefix, local time; continuation lines have none.
-    const ts = Date.parse(line.slice(0, 19).replace(" ", "T"));
-    if (!Number.isFinite(ts)) continue;
-    let m: RegExpExecArray | null;
-    if ((m = DESKTOP_RE.working.exec(line))) work(m[1], ts);
-    else if ((m = DESKTOP_RE.waiting.exec(line))) {
-      // The idle timer re-arms repeatedly during one idle period; keep the
-      // first ts so `c` acknowledgements hold and the wait age doesn't reset.
-      const prev = latest.get(m[1]);
-      latest.set(m[1], { state: "waiting", ts: prev?.state === "waiting" ? prev.ts : ts });
-    } else if (DESKTOP_RE.quit.test(line)) {
-      latest.clear();
-      lastWork.clear();
-      askedBy.clear();
-    } else if ((m = DESKTOP_RE.ask.exec(line))) {
-      askedBy.set(m[1], m[2]);
-      latest.set(m[2], { state: "waiting", ts });
-    } else if ((m = DESKTOP_RE.answer.exec(line))) {
-      const sid = askedBy.get(m[1]);
-      if (sid) work(sid, ts);
+  let m: RegExpExecArray | null;
+  if ((m = DESKTOP_RE.working.exec(line))) work(m[1]);
+  else if ((m = DESKTOP_RE.waiting.exec(line))) {
+    // The idle timer re-arms repeatedly during one idle period; keep the
+    // first ts so `c` acknowledgements hold and the wait age doesn't reset.
+    const prev = desktop.latest.get(m[1]);
+    desktop.latest.set(m[1], { state: "waiting", ts: prev?.state === "waiting" ? prev.ts : ts });
+  } else if (DESKTOP_RE.quit.test(line)) {
+    desktop.latest.clear();
+    desktop.askedBy.clear();
+  } else if ((m = DESKTOP_RE.ask.exec(line))) {
+    desktop.askedBy.set(m[1], m[2]);
+    desktop.latest.set(m[2], { state: "waiting", ts });
+  } else if ((m = DESKTOP_RE.answer.exec(line))) {
+    const sid = desktop.askedBy.get(m[1]);
+    if (sid) work(sid);
+  }
+}
+
+async function coworkRows(): Promise<Row[]> {
+  let fh;
+  try {
+    fh = await open(MAIN_LOG, "r");
+  } catch {
+    return [];
+  }
+  try {
+    const size = (await fh.stat()).size;
+    let start = desktop.offset;
+    if (start < 0 || start > size) {
+      // First poll, or the log rotated/truncated under us: (re)seed from the
+      // tail. Seeding is approximate; from here on the read is incremental.
+      start = Math.max(0, size - MAIN_LOG_TAIL);
+      desktop.latest.clear();
+      desktop.askedBy.clear();
     }
+    if (size > start) {
+      const buf = Buffer.alloc(size - start);
+      await fh.read(buf, 0, buf.length, start);
+      // Only consume complete lines; a partial last line waits for next poll.
+      const end = buf.lastIndexOf(10) + 1;
+      desktop.offset = start + end;
+      for (const line of buf.subarray(0, end).toString("utf8").split("\n")) foldDesktopLine(line);
+    }
+  } finally {
+    await fh.close();
   }
   const rows: Row[] = [];
-  for (const [id, { state, ts }] of latest) {
-    if (Date.now() - ts > STALE_MS) continue;
-    const rowId = `claude-desktop-${id}`;
-    let rowTs = ts;
-    if (state === "waiting") {
-      // Same episode (no working event since the remembered start): the
-      // remembered ts wins over a later re-arm the tail still shows.
-      const kept = waitingSince.get(rowId);
-      rowTs = kept !== undefined && kept >= (lastWork.get(id) ?? 0) ? Math.min(kept, ts) : ts;
-      waitingSince.set(rowId, rowTs);
-    } else {
-      waitingSince.delete(rowId);
+  for (const [id, { state, ts }] of desktop.latest) {
+    if (Date.now() - ts > STALE_MS) {
+      desktop.latest.delete(id);
+      continue;
     }
-    rows.push({ id: rowId, label: await desktopLabel(id), source: "claude-desktop", state, ts: rowTs });
+    rows.push({ id: `claude-desktop-${id}`, label: await desktopLabel(id), source: "claude-desktop", state, ts });
   }
   return rows;
 }
