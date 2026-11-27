@@ -221,6 +221,7 @@ const desktopTitles = new Map<string, string>();
 // (ages reset, acknowledgements broke) as old lines rolled out.
 const desktop = {
   offset: -1, // -1 = not seeded yet; also reset when the log rotates under us
+  ino: -1, // file identity: a rotated log restarts the offset even if it already grew past it
   latest: new Map<string, { state: Row["state"]; ts: number }>(),
   askedBy: new Map<string, string>(), // permission requestId -> session id
 };
@@ -280,12 +281,15 @@ async function coworkRows(): Promise<Row[]> {
     return [];
   }
   try {
-    const size = (await fh.stat()).size;
+    const st = await fh.stat();
+    const size = st.size;
     let start = desktop.offset;
-    if (start < 0 || start > size) {
+    if (start < 0 || start > size || st.ino !== desktop.ino) {
       // First poll, or the log rotated/truncated under us: (re)seed from the
       // tail. Seeding is approximate; from here on the read is incremental.
       start = Math.max(0, size - MAIN_LOG_TAIL);
+      desktop.offset = start;
+      desktop.ino = st.ino;
       desktop.latest.clear();
       desktop.askedBy.clear();
     }
