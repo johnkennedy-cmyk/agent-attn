@@ -2,12 +2,12 @@
 // agent is waiting on you — plus one row per live agent session.
 // Run: bun tui.ts   (q quits, --once prints one frame)
 // Sources: Claude Code via hook.mjs state files (precise); Claude Desktop
-// Cowork via coworkd.log freshness (working-only — no reliable "waiting"
-// signal exists for it yet); Cursor IDE via hook.mjs state files; Cursor
+// Cowork via session lifecycle lines in main.log (per-session working AND
+// waiting); Cursor IDE via hook.mjs state files; Cursor
 // agents via the self-hosted worker log; Cursor cloud sessions via
 // state.vscdb (usePrivateWorker false); gemini-cli / Antigravity: stubs.
 declare const Bun: any;
-import { open, readdir, readFile, stat, unlink } from "node:fs/promises";
+import { open, readdir, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
@@ -15,8 +15,16 @@ const HOME = process.env.HOME ?? "";
 const STATE_DIR = join(HOME, ".agent-attn", "state");
 const POLL_MS = 2000;
 const STALE_MS = 24 * 3600_000; // drop sessions with no signal for a day
-const COWORK_LOG = join(HOME, "Library", "Logs", "Claude", "coworkd.log");
-const COWORK_FRESH_MS = 60_000;
+// Claude Desktop's main process logs every Cowork session's lifecycle here;
+// coworkd.log no longer works as a freshness signal (the 2025-11 Cowork VM
+// rework only writes it in bursts at task boundaries).
+const MAIN_LOG = join(HOME, "Library", "Logs", "Claude", "main.log");
+const MAIN_LOG_TAIL = 262_144;
+const DESKTOP_SESSIONS_DIR = join(HOME, "Library", "Application Support", "Claude", "local-agent-mode-sessions");
+// Remote (cloud) Cowork sessions never appear in main.log's session lines;
+// their only local footprint is short VM one-shots in cowork_vm_node.log.
+const COWORK_VM_LOG = join(HOME, "Library", "Logs", "Claude", "cowork_vm_node.log");
+const COWORK_VM_FRESH_MS = 10 * 60_000;
 // Self-hosted `cursor-agent worker` processes. ~/.cursor/hooks.json is not
 // re-read after the worker starts, and cloud/My Machines agents do not use it
 // for the session anyway. The worker log is the local signal.
@@ -51,6 +59,23 @@ async function claudeCodeRows(): Promise<Row[]> {
     }
   }
   return rows;
+}
+
+async function readTail(path: string, bytes: number): Promise<string> {
+  try {
+    const fh = await open(path, "r");
+    try {
+      const st = await fh.stat();
+      const start = Math.max(0, st.size - bytes);
+      const buf = Buffer.alloc(st.size - start);
+      await fh.read(buf, 0, buf.length, start);
+      return buf.toString("utf8");
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return "";
+  }
 }
 
 function lineTs(line: string): number | null {
@@ -104,21 +129,8 @@ async function cursorAgentRows(): Promise<Row[]> {
     } catch {
       /* label stays generic */
     }
-    let text = "";
-    try {
-      const fh = await open(logPath, "r");
-      try {
-        const st = await fh.stat();
-        const start = Math.max(0, st.size - CURSOR_AGENT_TAIL);
-        const buf = Buffer.alloc(st.size - start);
-        await fh.read(buf, 0, buf.length, start);
-        text = buf.toString("utf8");
-      } finally {
-        await fh.close();
-      }
-    } catch {
-      continue;
-    }
+    const text = await readTail(logPath, CURSOR_AGENT_TAIL);
+    if (!text) continue;
     const active = new Map<string, number>();
     for (const line of text.split("\n")) {
       const ts = lineTs(line);
@@ -186,12 +198,160 @@ function cloudAgentRows(seenBcIds: Set<string>): Row[] {
   }
 }
 
-async function coworkRow(): Promise<Row | null> {
-  // ponytail: log freshness only — says "working", can never say "waiting";
-  // upgrade path is a real Cowork signal if one ever ships.
-  const st = await stat(COWORK_LOG).catch(() => null);
-  if (!st || Date.now() - st.mtimeMs > COWORK_FRESH_MS) return null;
-  return { id: "cowork", label: "cowork", source: "claude-desktop", state: "working", ts: st.mtimeMs };
+// Claude Desktop (Cowork) sessions. Desktop ships no hooks; its main process
+// logs each session's lifecycle to main.log, mapping onto the same states as
+// the Claude Code hook: prompt sent / permission answered -> working,
+// turn idle / permission requested -> waiting, idle disconnect -> gone.
+// ponytail: tail-parse of main.log; a log rotation mid-session drops rows
+// until the session logs again — acceptable for an advisory light.
+const DESKTOP_RE = {
+  working: /LocalAgentModeSessions\.sendMessage: sessionId=(local_[0-9a-f-]+)/,
+  waiting: /\[WarmLifecycle:cowork\] Starting idle timeout for (local_[0-9a-f-]+)/,
+  // A warm idle disconnect does NOT end the session (it still waits in the
+  // UI), so it is deliberately not an event. App quit is: the VM and every
+  // local session die with the app, invalidating all lines logged before it.
+  quit: /Running onQuitCleanup: cowork-vm-shutdown/,
+  ask: /Emitted tool permission request ([0-9a-f-]+) for \S+ in session (local_[0-9a-f-]+)/,
+  answer: /LocalAgentModeSessions\.respondToToolPermission: requestId=([0-9a-f-]+)/,
+};
+const desktopTitles = new Map<string, string>();
+// Persistent fold state. main.log is read incrementally from the last byte
+// offset, so every event is seen exactly once and episode identity is exact —
+// re-deriving state from a rolling tail window proved structurally leaky
+// (ages reset, acknowledgements broke) as old lines rolled out.
+const desktop = {
+  offset: -1, // -1 = not seeded yet; also reset when the log rotates under us
+  ino: -1, // file identity: a rotated log restarts the offset even if it already grew past it
+  latest: new Map<string, { state: Row["state"]; ts: number }>(),
+  askedBy: new Map<string, string>(), // permission requestId -> session id
+};
+
+async function desktopLabel(id: string): Promise<string> {
+  const hit = desktopTitles.get(id);
+  if (hit) return hit;
+  for (const org of await readdir(DESKTOP_SESSIONS_DIR).catch(() => [] as string[])) {
+    for (const user of await readdir(join(DESKTOP_SESSIONS_DIR, org)).catch(() => [] as string[])) {
+      try {
+        const s = JSON.parse(await readFile(join(DESKTOP_SESSIONS_DIR, org, user, `${id}.json`), "utf8"));
+        if (s.title) {
+          desktopTitles.set(id, String(s.title));
+          return String(s.title);
+        }
+      } catch {
+        /* not under this org/user */
+      }
+    }
+  }
+  return id.slice("local_".length, "local_".length + 8);
+}
+
+function foldDesktopLine(line: string) {
+  // "YYYY-MM-DD HH:MM:SS" prefix, local time; continuation lines have none.
+  const ts = Date.parse(line.slice(0, 19).replace(" ", "T"));
+  if (!Number.isFinite(ts)) return;
+  const work = (id: string) => {
+    desktop.latest.set(id, { state: "working", ts });
+    // Real new activity (seen exactly once) retires any acknowledgement.
+    ackedWaiting.delete(`claude-desktop-${id}`);
+  };
+  let m: RegExpExecArray | null;
+  if ((m = DESKTOP_RE.working.exec(line))) work(m[1]);
+  else if ((m = DESKTOP_RE.waiting.exec(line))) {
+    // The idle timer re-arms repeatedly during one idle period; keep the
+    // first ts so `c` acknowledgements hold and the wait age doesn't reset.
+    const prev = desktop.latest.get(m[1]);
+    desktop.latest.set(m[1], { state: "waiting", ts: prev?.state === "waiting" ? prev.ts : ts });
+  } else if (DESKTOP_RE.quit.test(line)) {
+    desktop.latest.clear();
+    desktop.askedBy.clear();
+  } else if ((m = DESKTOP_RE.ask.exec(line))) {
+    desktop.askedBy.set(m[1], m[2]);
+    desktop.latest.set(m[2], { state: "waiting", ts });
+  } else if ((m = DESKTOP_RE.answer.exec(line))) {
+    const sid = desktop.askedBy.get(m[1]);
+    if (sid) work(sid);
+  }
+}
+
+async function coworkRows(): Promise<Row[]> {
+  let fh;
+  try {
+    fh = await open(MAIN_LOG, "r");
+  } catch {
+    return [];
+  }
+  try {
+    const st = await fh.stat();
+    const size = st.size;
+    let start = desktop.offset;
+    if (start < 0 || start > size || st.ino !== desktop.ino) {
+      // First poll, or the log rotated/truncated under us: (re)seed from the
+      // tail. Seeding is approximate; from here on the read is incremental.
+      start = Math.max(0, size - MAIN_LOG_TAIL);
+      desktop.offset = start;
+      desktop.ino = st.ino;
+      desktop.latest.clear();
+      desktop.askedBy.clear();
+    }
+    if (size > start) {
+      const buf = Buffer.alloc(size - start);
+      await fh.read(buf, 0, buf.length, start);
+      // Only consume complete lines; a partial last line waits for next poll.
+      const end = buf.lastIndexOf(10) + 1;
+      desktop.offset = start + end;
+      for (const line of buf.subarray(0, end).toString("utf8").split("\n")) foldDesktopLine(line);
+    }
+  } finally {
+    await fh.close();
+  }
+  const rows: Row[] = [];
+  for (const [id, { state, ts }] of desktop.latest) {
+    if (Date.now() - ts > STALE_MS) {
+      desktop.latest.delete(id);
+      continue;
+    }
+    rows.push({ id: `claude-desktop-${id}`, label: await desktopLabel(id), source: "claude-desktop", state, ts });
+  }
+  return rows;
+}
+
+// One row per remote Cowork session with a recent VM one-shot. Log line:
+// "YYYY-MM-DD HH:MM:SS [info] [vmOneShot] Running: bash [2 arg(s)] as rcw-<id>"
+// where rcw-<id> is the session id (session_<Id>) lowercased. Freshness is
+// the only signal here — a cloud turn ends server-side, so never "waiting".
+async function remoteCoworkRows(): Promise<Row[]> {
+  const text = await readTail(COWORK_VM_LOG, MAIN_LOG_TAIL);
+  if (!text) return [];
+  const latest = new Map<string, number>();
+  for (const line of text.split("\n")) {
+    const m = /\[vmOneShot\] Running: .* as (rcw-[a-z0-9]+)/.exec(line);
+    if (!m) continue;
+    const ts = Date.parse(line.slice(0, 19).replace(" ", "T"));
+    if (Number.isFinite(ts)) latest.set(m[1], ts);
+  }
+  // Session id suffix (lowercased) -> first shared folder's basename.
+  const folderOf = new Map<string, string>();
+  for (const org of await readdir(DESKTOP_SESSIONS_DIR).catch(() => [] as string[])) {
+    for (const user of await readdir(join(DESKTOP_SESSIONS_DIR, org)).catch(() => [] as string[])) {
+      try {
+        const spaces = JSON.parse(await readFile(join(DESKTOP_SESSIONS_DIR, org, user, "remote-session-spaces.json"), "utf8"));
+        for (const e of spaces.entries ?? []) {
+          const suffix = String(e.sessionId ?? "").replace(/^session_/, "").toLowerCase();
+          const folder = String((e.folders ?? [])[0] ?? "").split("/").filter(Boolean).pop();
+          if (suffix && folder) folderOf.set(suffix, folder);
+        }
+      } catch {
+        /* no remote sessions under this org/user */
+      }
+    }
+  }
+  const rows: Row[] = [];
+  for (const [id, ts] of latest) {
+    if (Date.now() - ts > COWORK_VM_FRESH_MS) continue;
+    const label = folderOf.get(id.slice("rcw-".length)) ?? "cowork remote";
+    rows.push({ id: `claude-desktop-${id}`, label, source: "claude-desktop", state: "working", ts });
+  }
+  return rows;
 }
 
 // Probe stubs — neither tool is installed on this machine today.
@@ -205,7 +365,10 @@ const ago = (ts: number) => {
 };
 
 let notified = new Set<string>();
-// `c` acknowledges log-derived waiting rows (they have no state file to unlink).
+// `c` acknowledges log-derived waiting rows (they have no state file to
+// unlink). The ack records WHEN it was given; a waiting row is suppressed
+// while its event ts is not newer than that, so a new wait episode (newer
+// events) resurfaces even if its working phase fell between two polls.
 const ackedWaiting = new Map<string, number>();
 
 // A filled circle drawn in block cells, diameter `diam` rows, centered in
@@ -275,13 +438,23 @@ async function processAlive(pattern: string): Promise<boolean> {
 }
 
 async function collect(): Promise<Row[]> {
-  const [state, cw, agents, gm, ag] = await Promise.all([claudeCodeRows(), coworkRow(), cursorAgentRows(), geminiRows(), antigravityRows()]);
+  const [state, cw, cwRemote, agents, gm, ag] = await Promise.all([claudeCodeRows(), coworkRows(), remoteCoworkRows(), cursorAgentRows(), geminiRows(), antigravityRows()]);
   const seenBc = new Set(agents.map((r) => r.id.replace(/^cursor-agent-/, "")));
-  let rows = [...state, ...(cw ? [cw] : []), ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag].filter((r) => ackedWaiting.get(r.id) !== r.ts);
+  let rows = [...state, ...cw, ...cwRemote, ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag];
+  // A row observed working always clears its ack; the ts cutoff below only
+  // covers working phases that fell entirely between two polls.
+  for (const r of rows) if (r.state === "working") ackedWaiting.delete(r.id);
+  rows = rows.filter((r) => !(r.state === "waiting" && (ackedWaiting.get(r.id) ?? -1) >= r.ts));
   // A quit app can't send its "session end" hook — drop its leftover rows.
   if (rows.some((r) => r.source === "cursor") && !(await processAlive("Cursor.app/Contents/MacOS"))) {
     for (const r of rows.filter((r) => r.source === "cursor")) unlink(join(STATE_DIR, r.id)).catch(() => {});
     rows = rows.filter((r) => r.source !== "cursor");
+  }
+  // Same for Claude Desktop LOCAL sessions: their main.log lines outlive the
+  // app. Cloud rows stay — a cloud turn keeps running with the app closed,
+  // and they self-expire after COWORK_VM_FRESH_MS anyway.
+  if (rows.some((r) => r.id.startsWith("claude-desktop-local_")) && !(await processAlive("Claude.app/Contents/MacOS/Claude"))) {
+    rows = rows.filter((r) => !r.id.startsWith("claude-desktop-local_"));
   }
   return rows;
 }
@@ -319,7 +492,7 @@ process.stdout.on("resize", render);
 // Acknowledge: a session closed back to the main menu never fires SessionEnd,
 // so its final Stop leaves a red row forever. `c` clears current waiting rows.
 async function clearWaiting() {
-  for (const r of rows.filter((r) => r.state === "waiting" && !r.id.endsWith(".json"))) ackedWaiting.set(r.id, r.ts);
+  for (const r of rows.filter((r) => r.state === "waiting" && !r.id.endsWith(".json"))) ackedWaiting.set(r.id, Date.now());
   for (const r of rows.filter((r) => r.state === "waiting" && r.id.endsWith(".json"))) {
     const path = join(STATE_DIR, r.id);
     try {
