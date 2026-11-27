@@ -321,10 +321,10 @@ const ago = (ts: number) => {
 
 let notified = new Set<string>();
 // `c` acknowledges log-derived waiting rows (they have no state file to
-// unlink). An acknowledgement is keyed by row id and holds until the session
-// is next seen working — a timestamp can't key the wait episode, because it
-// is re-derived from a rolling log tail and shifts as old lines roll out.
-const ackedWaiting = new Set<string>();
+// unlink). The ack records WHEN it was given; a waiting row is suppressed
+// while its event ts is not newer than that, so a new wait episode (newer
+// events) resurfaces even if its working phase fell between two polls.
+const ackedWaiting = new Map<string, number>();
 
 // A filled circle drawn in block cells, diameter `diam` rows, centered in
 // `cols` columns (terminal cells are ~2:1 tall, so width = 2× the row span).
@@ -395,9 +395,8 @@ async function processAlive(pattern: string): Promise<boolean> {
 async function collect(): Promise<Row[]> {
   const [state, cw, cwRemote, agents, gm, ag] = await Promise.all([claudeCodeRows(), coworkRows(), remoteCoworkRows(), cursorAgentRows(), geminiRows(), antigravityRows()]);
   const seenBc = new Set(agents.map((r) => r.id.replace(/^cursor-agent-/, "")));
-  let rows = [...state, ...cw, ...cwRemote, ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag];
-  for (const r of rows) if (r.state === "working") ackedWaiting.delete(r.id);
-  rows = rows.filter((r) => !(r.state === "waiting" && ackedWaiting.has(r.id)));
+  let rows = [...state, ...cw, ...cwRemote, ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag]
+    .filter((r) => !(r.state === "waiting" && (ackedWaiting.get(r.id) ?? -1) >= r.ts));
   // A quit app can't send its "session end" hook — drop its leftover rows.
   if (rows.some((r) => r.source === "cursor") && !(await processAlive("Cursor.app/Contents/MacOS"))) {
     for (const r of rows.filter((r) => r.source === "cursor")) unlink(join(STATE_DIR, r.id)).catch(() => {});
@@ -445,7 +444,7 @@ process.stdout.on("resize", render);
 // Acknowledge: a session closed back to the main menu never fires SessionEnd,
 // so its final Stop leaves a red row forever. `c` clears current waiting rows.
 async function clearWaiting() {
-  for (const r of rows.filter((r) => r.state === "waiting" && !r.id.endsWith(".json"))) ackedWaiting.add(r.id);
+  for (const r of rows.filter((r) => r.state === "waiting" && !r.id.endsWith(".json"))) ackedWaiting.set(r.id, Date.now());
   for (const r of rows.filter((r) => r.state === "waiting" && r.id.endsWith(".json"))) {
     const path = join(STATE_DIR, r.id);
     try {
