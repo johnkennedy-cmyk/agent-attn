@@ -215,6 +215,11 @@ const DESKTOP_RE = {
   answer: /LocalAgentModeSessions\.respondToToolPermission: requestId=([0-9a-f-]+)/,
 };
 const desktopTitles = new Map<string, string>();
+// Wait-episode starts, remembered across polls: the fold's first waiting ts
+// drifts forward as pre-episode lines roll out of the log tail, which would
+// reset the shown age and bust `c` acknowledgements. An entry is only valid
+// while no working event newer than it appears in the tail.
+const waitingSince = new Map<string, number>();
 
 async function desktopLabel(id: string): Promise<string> {
   const hit = desktopTitles.get(id);
@@ -239,13 +244,18 @@ async function coworkRows(): Promise<Row[]> {
   const text = await readTail(MAIN_LOG, MAIN_LOG_TAIL);
   if (!text) return [];
   const latest = new Map<string, { state: Row["state"]; ts: number }>();
+  const lastWork = new Map<string, number>(); // last working EVENT, even if not the final state
   const askedBy = new Map<string, string>(); // permission requestId -> session id
+  const work = (id: string, ts: number) => {
+    latest.set(id, { state: "working", ts });
+    lastWork.set(id, ts);
+  };
   for (const line of text.split("\n")) {
     // "YYYY-MM-DD HH:MM:SS" prefix, local time; continuation lines have none.
     const ts = Date.parse(line.slice(0, 19).replace(" ", "T"));
     if (!Number.isFinite(ts)) continue;
     let m: RegExpExecArray | null;
-    if ((m = DESKTOP_RE.working.exec(line))) latest.set(m[1], { state: "working", ts });
+    if ((m = DESKTOP_RE.working.exec(line))) work(m[1], ts);
     else if ((m = DESKTOP_RE.waiting.exec(line))) {
       // The idle timer re-arms repeatedly during one idle period; keep the
       // first ts so `c` acknowledgements hold and the wait age doesn't reset.
@@ -253,19 +263,31 @@ async function coworkRows(): Promise<Row[]> {
       latest.set(m[1], { state: "waiting", ts: prev?.state === "waiting" ? prev.ts : ts });
     } else if (DESKTOP_RE.quit.test(line)) {
       latest.clear();
+      lastWork.clear();
       askedBy.clear();
     } else if ((m = DESKTOP_RE.ask.exec(line))) {
       askedBy.set(m[1], m[2]);
       latest.set(m[2], { state: "waiting", ts });
     } else if ((m = DESKTOP_RE.answer.exec(line))) {
       const sid = askedBy.get(m[1]);
-      if (sid) latest.set(sid, { state: "working", ts });
+      if (sid) work(sid, ts);
     }
   }
   const rows: Row[] = [];
   for (const [id, { state, ts }] of latest) {
     if (Date.now() - ts > STALE_MS) continue;
-    rows.push({ id: `claude-desktop-${id}`, label: await desktopLabel(id), source: "claude-desktop", state, ts });
+    const rowId = `claude-desktop-${id}`;
+    let rowTs = ts;
+    if (state === "waiting") {
+      // Same episode (no working event since the remembered start): the
+      // remembered ts wins over a later re-arm the tail still shows.
+      const kept = waitingSince.get(rowId);
+      rowTs = kept !== undefined && kept >= (lastWork.get(id) ?? 0) ? Math.min(kept, ts) : ts;
+      waitingSince.set(rowId, rowTs);
+    } else {
+      waitingSince.delete(rowId);
+    }
+    rows.push({ id: rowId, label: await desktopLabel(id), source: "claude-desktop", state, ts: rowTs });
   }
   return rows;
 }
@@ -395,8 +417,11 @@ async function processAlive(pattern: string): Promise<boolean> {
 async function collect(): Promise<Row[]> {
   const [state, cw, cwRemote, agents, gm, ag] = await Promise.all([claudeCodeRows(), coworkRows(), remoteCoworkRows(), cursorAgentRows(), geminiRows(), antigravityRows()]);
   const seenBc = new Set(agents.map((r) => r.id.replace(/^cursor-agent-/, "")));
-  let rows = [...state, ...cw, ...cwRemote, ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag]
-    .filter((r) => !(r.state === "waiting" && (ackedWaiting.get(r.id) ?? -1) >= r.ts));
+  let rows = [...state, ...cw, ...cwRemote, ...agents, ...cloudAgentRows(seenBc), ...gm, ...ag];
+  // A row observed working always clears its ack; the ts cutoff below only
+  // covers working phases that fell entirely between two polls.
+  for (const r of rows) if (r.state === "working") ackedWaiting.delete(r.id);
+  rows = rows.filter((r) => !(r.state === "waiting" && (ackedWaiting.get(r.id) ?? -1) >= r.ts));
   // A quit app can't send its "session end" hook — drop its leftover rows.
   if (rows.some((r) => r.source === "cursor") && !(await processAlive("Cursor.app/Contents/MacOS"))) {
     for (const r of rows.filter((r) => r.source === "cursor")) unlink(join(STATE_DIR, r.id)).catch(() => {});
